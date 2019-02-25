@@ -1,40 +1,53 @@
 'use strict';
-const {URL, URLSearchParams} = require('url'); // TODO: Use the `URL` global when targeting Node.js 10
-const util = require('util');
-const EventEmitter = require('events');
-const http = require('http');
-const https = require('https');
-const urlLib = require('url');
-const CacheableRequest = require('cacheable-request');
-const toReadableStream = require('to-readable-stream');
-const is = require('@sindresorhus/is');
-const timer = require('@szmarczak/http-timer');
-const timedOut = require('./utils/timed-out');
-const getBodySize = require('./utils/get-body-size').default;
-const isFormData = require('./utils/is-form-data').default;
-const getResponse = require('./get-response').default;
-const progress = require('./progress');
-const {CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError, TimeoutError} = require('./errors');
-const urlToOptions = require('./utils/url-to-options').default;
+import {format as urlFormat, URL, URLSearchParams} from 'url'; // TODO: Use the `URL` global when targeting Node.js 10
+import {promisify} from 'util';
+import {EventEmitter} from 'events';
+import * as http from 'http';
+import {ClientRequest} from 'http';
+import * as https from 'https';
+import {Stream} from 'stream';
+import * as CacheableRequest from 'cacheable-request';
+import toReadableStream from 'to-readable-stream';
+import * as FormData from 'form-data';
+import is from '@sindresorhus/is';
+import timer from '@szmarczak/http-timer';
+import timedOut, {TimeoutError as TimedOutTimeoutError} from './utils/timed-out';
+import getBodySize from './utils/get-body-size';
+import isFormData from './utils/is-form-data';
+import getResponse from './get-response';
+import * as progress from './progress';
+import {CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError, TimeoutError} from './errors';
+import urlToOptions from './utils/url-to-options';
+import {RequestFn, Options, RetryFn, RetryOption, Response} from './utils/types';
 
 const getMethodRedirectCodes = new Set([300, 301, 302, 303, 304, 305, 307, 308]);
 const allMethodRedirectCodes = new Set([300, 303, 307, 308]);
 
-module.exports = (options, input) => {
+type ProcessVersions = typeof process.versions
+interface ProcessVersionsWithElectron extends ProcessVersions {
+	electron: string;
+}
+
+export interface RequestAsEventEmitter extends EventEmitter {
+	retry: (error: Error) => (boolean | undefined);
+	abort: () => void;
+}
+
+export default (options: Options, input: Stream) => {
 	const emitter = new EventEmitter();
-	const redirects = [];
-	let currentRequest;
-	let requestUrl;
-	let redirectString;
-	let uploadBodySize;
+	const redirects = [] as string[];
+	let currentRequest: ClientRequest;
+	let requestUrl: string;
+	let redirectString: string;
+	let uploadBodySize: number | undefined;
 	let retryCount = 0;
 	let shouldAbort = false;
 
-	const setCookie = options.cookieJar ? util.promisify(options.cookieJar.setCookie.bind(options.cookieJar)) : null;
-	const getCookieString = options.cookieJar ? util.promisify(options.cookieJar.getCookieString.bind(options.cookieJar)) : null;
+	const setCookie = options.cookieJar ? promisify(options.cookieJar.setCookie.bind(options.cookieJar)) : null;
+	const getCookieString = options.cookieJar ? promisify(options.cookieJar.getCookieString.bind(options.cookieJar)) : null;
 	const agents = is.object(options.agent) ? options.agent : null;
 
-	const emitError = async error => {
+	const emitError = async (error: Error) => {
 		try {
 			for (const hook of options.hooks.beforeError) {
 				// eslint-disable-next-line no-await-in-loop
@@ -47,7 +60,7 @@ module.exports = (options, input) => {
 		}
 	};
 
-	const get = async options => {
+	const get = async (options: Options) => {
 		const currentUrl = redirectString || requestUrl;
 
 		if (options.protocol !== 'http:' && options.protocol !== 'https:') {
@@ -56,11 +69,11 @@ module.exports = (options, input) => {
 
 		decodeURI(currentUrl);
 
-		let fn;
-		if (is.function(options.request)) {
-			fn = {request: options.request};
+		let requestFn: RequestFn;
+		if (is.function_(options.request)) {
+			requestFn = options.request;
 		} else {
-			fn = options.protocol === 'https:' ? https : http;
+			requestFn = options.protocol === 'https:' ? https.request : http.request;
 		}
 
 		if (agents) {
@@ -69,10 +82,10 @@ module.exports = (options, input) => {
 		}
 
 		/* istanbul ignore next: electron.net is broken */
-		if (options.useElectronNet && process.versions.electron) {
+		if (options.useElectronNet && (process.versions as ProcessVersionsWithElectron).electron) {
 			const r = ({x: require})['yx'.slice(1)]; // Trick webpack
 			const electron = r('electron');
-			fn = electron.net || electron.remote.net;
+			requestFn = electron.net.request || electron.remote.net.request;
 		}
 
 		if (options.cookieJar) {
@@ -84,7 +97,7 @@ module.exports = (options, input) => {
 		}
 
 		let timings;
-		const handleResponse = async response => {
+		const handleResponse = async (response: Response) => {
 			try {
 				/* istanbul ignore next: fixes https://github.com/electron/electron/blob/cbb460d47628a7a146adf4419ed48550a98b2923/lib/browser/api/net.js#L59-L65 */
 				if (options.useElectronNet) {
@@ -95,7 +108,7 @@ module.exports = (options, input) => {
 							}
 
 							const value = target[name];
-							return is.function(value) ? value.bind(target) : value;
+							return is.function_(value) ? value.bind(target) : value;
 						}
 					});
 				}
@@ -160,7 +173,7 @@ module.exports = (options, input) => {
 			}
 		};
 
-		const handleRequest = request => {
+		const handleRequest = (request: ClientRequest) => {
 			if (shouldAbort) {
 				request.abort();
 				return;
@@ -173,13 +186,13 @@ module.exports = (options, input) => {
 					return;
 				}
 
-				if (error instanceof timedOut.TimeoutError) {
+				if (error instanceof TimedOutTimeoutError) {
 					error = new TimeoutError(error, timings, options);
 				} else {
 					error = new RequestError(error, options);
 				}
 
-				if (emitter.retry(error) === false) {
+				if ((emitter as RequestAsEventEmitter).retry(error) === false) {
 					emitError(error);
 				}
 			});
@@ -189,7 +202,7 @@ module.exports = (options, input) => {
 			progress.upload(request, emitter, uploadBodySize);
 
 			if (options.gotTimeout) {
-				timedOut.default(request, options.gotTimeout, options);
+				timedOut(request, options.gotTimeout, options);
 			}
 
 			emitter.emit('request', request);
@@ -217,7 +230,7 @@ module.exports = (options, input) => {
 		};
 
 		if (options.cache) {
-			const cacheableRequest = new CacheableRequest(fn.request, options.cache);
+			const cacheableRequest = new CacheableRequest(requestFn, options.cache);
 			const cacheRequest = cacheableRequest(options, handleResponse);
 
 			cacheRequest.once('error', error => {
@@ -230,20 +243,20 @@ module.exports = (options, input) => {
 
 			cacheRequest.once('request', handleRequest);
 		} else {
-			// Catches errors thrown by calling fn.request(...)
+			// Catches errors thrown by calling requestFn(...)
 			try {
-				handleRequest(fn.request(options, handleResponse));
+				handleRequest(requestFn(options, handleResponse));
 			} catch (error) {
 				emitError(new RequestError(error, options));
 			}
 		}
 	};
 
-	emitter.retry = error => {
-		let backoff;
+	(emitter as RequestAsEventEmitter).retry = (error: Error) : (boolean | undefined) => {
+		let backoff: number;
 
 		try {
-			backoff = options.retry.retries(++retryCount, error);
+			backoff = ((options.retry as RetryOption).retries as RetryFn)(++retryCount, error);
 		} catch (error2) {
 			emitError(error2);
 			return;
@@ -270,7 +283,7 @@ module.exports = (options, input) => {
 		return false;
 	};
 
-	emitter.abort = () => {
+	(emitter as RequestAsEventEmitter).abort = () => {
 		if (currentRequest) {
 			currentRequest.abort();
 		} else {
@@ -295,8 +308,9 @@ module.exports = (options, input) => {
 				}
 
 				if (is.object(body) && isFormData(body)) {
+					const formData = body as FormData;
 					// Special case for https://github.com/form-data/form-data
-					headers['content-type'] = headers['content-type'] || `multipart/form-data; boundary=${body.getBoundary()}`;
+					headers['content-type'] = headers['content-type'] || `multipart/form-data; boundary=${formData.getBoundary()}`;
 				} else if (!is.nodeStream(body) && !is.string(body) && !is.buffer(body)) {
 					throw new TypeError('The `body` option must be a stream.Readable, string, Buffer, Object or Array');
 				}
@@ -334,7 +348,7 @@ module.exports = (options, input) => {
 				options.headers.accept = 'application/json';
 			}
 
-			requestUrl = options.href || (new URL(options.path, urlLib.format(options))).toString();
+			requestUrl = options.href || (new URL(options.path, urlFormat(options))).toString();
 
 			await get(options);
 		} catch (error) {
@@ -342,5 +356,5 @@ module.exports = (options, input) => {
 		}
 	});
 
-	return emitter;
+	return emitter as RequestAsEventEmitter;
 };

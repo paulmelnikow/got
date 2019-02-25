@@ -1,10 +1,11 @@
 import {IncomingMessage} from 'http';
-import {RequestOptions} from 'https';
+import {request, RequestOptions} from 'https';
 import {Readable as ReadableStream} from 'stream';
 import {PCancelable} from 'p-cancelable';
+import {CookieJar} from 'tough-cookie';
 import {Hooks} from '../known-hook-events';
 
-export type Method = 'GET' | 'PUT' | 'HEAD' | 'DELETE' | 'OPTIONS' | 'TRACE' | 'get' | 'put' | 'head' | 'delete' | 'options' | 'trace';
+export type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'HEAD' | 'DELETE' | 'OPTIONS' | 'TRACE' | 'get' | 'post' | 'put' | 'patch' | 'head' | 'delete' | 'options' | 'trace';
 export type ErrorCode = 'ETIMEDOUT' | 'ECONNRESET' | 'EADDRINUSE' | 'ECONNREFUSED' | 'EPIPE' | 'ENOTFOUND' | 'ENETUNREACH' | 'EAI_AGAIN';
 export type StatusCode = 408 | 413 | 429 | 500 | 502 | 503 | 504;
 
@@ -50,8 +51,10 @@ export interface InterfaceWithDefaults extends Instance {
 	};
 }
 
-interface RetryOption {
-	retries?: ((retry: number, error: Error) => number) | number;
+export type RetryFn = (retry: number, error: Error) => number;
+
+export interface RetryOption {
+	retries?: RetryFn | number;
 	methods?: Method[];
 	statusCodes?: StatusCode[];
 	maxRetryAfter?: number;
@@ -61,6 +64,10 @@ interface RetryOption {
 export interface MergedOptions extends Options {
 	retry: RetryOption;
 }
+
+export type RequestFn = typeof request;
+
+type Agent = typeof RequestOptions.agent
 
 export interface Options extends RequestOptions {
 	host: string;
@@ -77,6 +84,9 @@ export interface Options extends RequestOptions {
 	method?: Method;
 	retry?: number | RetryOption;
 	throwHttpErrors?: boolean;
+	cookieJar?: CookieJar;
+	request?: RequestFn;
+	agent: Agent | { [key: string]: Agent }
 	// TODO: Remove this once TS migration is complete and all options are defined.
 	[key: string]: unknown;
 }
